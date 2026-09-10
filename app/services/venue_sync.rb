@@ -1,24 +1,30 @@
-# Keeps our local venue records in step with the upstream festival system.
-#
-# Inherited from the previous programming integration. Given an array of venue
-# hashes from the API, it upserts each one into our venues table.
-#
-#   VenueSync.new(venues_payload).call
-#
-# where each entry looks like:
-#   { "id" => "VEN-01", "name" => "Grand Cinema", "address" => "...", "capacity" => 320 }
 class VenueSync
+  Result = Struct.new(:created, :updated, :errors, keyword_init: true)
+
   def initialize(venues)
     @venues = venues
   end
 
   def call
+    created = 0
+    updated = 0
+    errors  = []
+
     @venues.each do |attrs|
-      venue = Venue.find_or_initialize_by(name: attrs["name"])
-      venue.external_id = attrs.fetch("id")
-      venue.address     = attrs["address"]
-      venue.capacity    = attrs["capacity"]
+      venue = Venue.find_or_initialize_by(external_id: attrs.fetch("id"))
+      was_new = venue.new_record?
+      venue.name     = attrs["name"]
+      venue.address  = attrs["address"]
+      venue.capacity = attrs["capacity"]
+      changed = venue.changed?
       venue.save!
+
+      created += 1 if was_new
+      updated += 1 if !was_new && changed
+    rescue => e
+      errors << { "external_id" => attrs["id"], "message" => e.message }
     end
+
+    Result.new(created: created, updated: updated, errors: errors)
   end
 end
