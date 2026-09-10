@@ -90,3 +90,68 @@ Sync `generation=1`, then `generation=2`, and check the database is right. Then 
 ## Submitting
 
 A private git repo with your commits. Please don't squash.
+
+---
+
+## Notes on this submission
+
+### What I built
+
+- `ScreeningSync` pulls `/mock_api/screenings` page by page. Each page is persisted
+  before moving to the next, so a failure on page 3 doesn't lose pages 1-2. Within a
+  page, each screening (and each film/venue it references) is upserted in its own
+  transaction and a bad record is caught and logged rather than aborting the page.
+  Everything is upserted on `external_id`, so re-running a generation is a no-op and
+  re-running after an upstream change updates in place.
+- A Postgres advisory lock (`pg_try_advisory_lock`) means a second sync started while
+  one is already running skips instead of racing it.
+- Every run writes a `SyncRun` row (status, timing, created/updated/failed counts,
+  captured errors), including failed and skipped runs, so you can tell after the fact
+  whether a run worked and what it touched.
+- `ScreeningSyncJob` is a thin, retryable (`sidekiq_options retry: 5`) Sidekiq wrapper
+  around `ScreeningSync`. `rake sync:screenings` enqueues one, for manual runs or a
+  cron entry.
+- The screenings index: fixed the filter form so it targets the `screenings` Turbo
+  Frame instead of doing a full page reload, eager-loaded `film`/`venue` to remove the
+  N+1 in the results table, and wired the `q` param (accepted by the form, silently
+  dropped by the controller) to an actual `films.title ILIKE` filter.
+
+### What I'd change in the existing code, and why
+
+`VenueSync` matched venues by `name` instead of `external_id`. `external_id` is the
+only field the API guarantees is stable — generation 2's fixture data renames a venue
+on purpose to prove this. Matching on name meant a rename created a second venue
+instead of updating the first, which is exactly the kind of drift a "local copy of an
+external source of truth" can't afford. I fixed it to match on `external_id`, and also
+gave it per-record error handling — the original raised on the first bad record and
+lost the rest of the batch. I applied the same fix to a new `FilmSync`, since a
+title-keyed match has the identical failure mode and generation 2 retitles a film on
+purpose too.
+
+### What I'd do differently with more time
+
+- I didn't wire an actual scheduler (`sidekiq-cron` or similar) — `rake sync:screenings`
+  is what a cron entry or scheduler would call, but nothing calls it automatically here.
+  More importantly, I think a fixed-interval full sync is the wrong long-term shape for
+  this data: a venue moving at 2pm during festival week needs to show up in minutes, not
+  after up to an hour of polling drift. I'd rather the upstream system push changes
+  (webhook or event feed) and keep the scheduled full sync as a periodic reconciliation
+  safety net, not the primary path.
+- The search field requires clicking "Filter" rather than submitting as you type. A
+  debounced Stimulus controller would be a small, natural addition — left out to stay
+  inside what the brief actually asked for.
+- `SyncRun#errors` is a jsonb array. Fine at this scale; if error volume or alerting
+  needs grew, I'd split it into its own table.
+
+### Assumptions
+
+- Generation 2 removes one screening (`SCR-0060`) upstream. I did not implement
+  deletion handling. You can't safely tell "genuinely removed" apart from "just not on
+  a page we've fetched yet" except after a fully successful run, and even then I'd
+  rather mark a screening as no-longer-offered (the same way `cancelled` is already a
+  status, not a delete) than hard-delete it — historical/booking data further down the
+  line shouldn't dangle on a foreign key to a row that vanished. Calling this out
+  rather than quietly leaving it undone.
+- `generation` is a testing-only concept the mock API exposes; the real sync never
+  passes it, so it always gets whichever generation the upstream API is currently
+  serving.
